@@ -70,6 +70,16 @@ export class SessionProviderRouter {
     return this.route;
   }
 
+  /** Close provider owners not represented by the currently bound client. */
+  closeOwnedResources() {
+    return this.registry.closeOwnedResources();
+  }
+
+  /** Report retained candidate cleanup without performing cleanup work. */
+  hasPendingOwnedResources(): boolean {
+    return this.registry.hasPendingOwnedResources();
+  }
+
   /** Resolve target routes before any provider client is created. */
   async resolve(
     target: BinaryTarget,
@@ -125,7 +135,11 @@ const selectableRoute = (
         ? undefined
         : new CompositeProvider(providers);
   const identity = provider?.identity() ?? emptyProviderIdentity();
-  const capabilities = capabilityMap(provider?.capabilities() ?? []);
+  // The binding attributes deep-provider capabilities to the resolved version.
+  const capabilities = capabilityMap([
+    ...auxiliaryProviders.flatMap((auxiliary) => auxiliary.capabilities()),
+    ...(binding?.capabilities ?? []),
+  ]);
   return {
     identity,
     capabilities,

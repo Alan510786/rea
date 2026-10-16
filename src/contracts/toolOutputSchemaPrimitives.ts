@@ -24,6 +24,7 @@ import {
 } from "../domain/providerOperationHealth.js";
 import { analysisErrorProjectionSchema } from "./errorSchemas.js";
 import { relationshipCoverageSchema } from "../domain/relationshipCoverage.js";
+import { ZIP_PACKAGE_FORMATS } from "../domain/zipPackageFormat.js";
 
 /** Specialize the single normalized result inside a complete Evidence record. */
 export const evidenceResultOf = <Schema extends z.ZodType>(schema: Schema) =>
@@ -59,11 +60,7 @@ export const targetFormatSchema = z.enum([
   "dos-mz",
   "dos-com",
   "raw-binary",
-  "zip",
-  "ipa",
-  "apk",
-  "msix",
-  "appx",
+  ...ZIP_PACKAGE_FORMATS,
   "asar",
   "dmg",
   "pkg",
@@ -466,6 +463,7 @@ export const expandToolAvailability = (
 
 export const sessionProvider = z
   .object({
+    cleanup_pending: z.boolean(),
     capabilities: z.array(providerCapabilitySet),
     analysis_run: analysisRun,
     analysis_activity: analysisActivity,
@@ -508,7 +506,7 @@ export const sessionProvider = z
         name: z.string(),
         version: z.string(),
         started_at: z.string(),
-        command_path: z.string(),
+        command_path: z.string().nullable(),
       }),
       sdk: z.object({
         server: z.string(),

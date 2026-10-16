@@ -30,6 +30,7 @@ interface BinarySessionStatusInput {
   readonly runtimeLineageSnapshots: readonly ProviderRuntimeLineageSnapshot[];
   readonly requestActivitySnapshots: readonly ProviderRequestActivitySnapshot[];
   readonly providerOperationHealth?: ProviderOperationHealth | null;
+  readonly cleanupPending?: boolean;
 }
 
 /** Project internal provider routing state into the caller-visible session status. */
@@ -42,6 +43,7 @@ export const binarySessionStatus = ({
   runtimeLineageSnapshots,
   requestActivitySnapshots,
   providerOperationHealth,
+  cleanupPending = false,
 }: BinarySessionStatusInput): JsonValue => {
   const routeCapabilities = [...route.capabilities.values()]
     .filter(({ operation }) => operation !== "inventory_artifact")
@@ -84,6 +86,7 @@ export const binarySessionStatus = ({
       ),
     }));
   const common = {
+    cleanup_pending: cleanupPending,
     capabilities,
     analysis_provider_binding: analysisProviderBinding,
     analysis_provider_candidates: analysisProviderCandidates,
@@ -198,15 +201,19 @@ type CapabilityAvailabilityCode = Exclude<
   CapabilityDescriptor["availabilityCode"],
   undefined
 >;
-type CapabilityProjection = Omit<CapabilityDescriptor, "available" | "reason"> &
-  (
+// Wire capability projection also covers target-free operations outside binary routing.
+type CapabilityProjection = Omit<
+  CapabilityDescriptor,
+  "operation" | "available" | "reason"
+> & { readonly operation: string } & (
     | { readonly available: true; readonly reason: null }
     | { readonly available: false; readonly reason: string }
   );
 type ProviderCapabilityGroup = ProviderCapabilitySet["groups"][number];
 
 /** Group inline capability facts without merging distinct providers or states. */
-const providerCapabilitySets = (
+/** Project provider descriptors once for binary and target-free status consumers. */
+export const providerCapabilitySets = (
   descriptors: readonly CapabilityProjection[],
 ): ProviderCapabilitySet[] => {
   const providers = new Map<

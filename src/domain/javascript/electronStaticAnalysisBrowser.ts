@@ -9,6 +9,7 @@ import type {
   ElectronUtilityProcessFinding,
   ElectronWebPreference,
 } from "./electronStaticAnalysisTypes.js";
+import { contextBridgeExposureArguments } from "./javascriptContextBridgeExposure.js";
 import {
   boundedExpression,
   collectContextBridgeMembers,
@@ -24,7 +25,10 @@ import {
   staticPath,
   staticPathResolutionContext,
 } from "./javascriptStaticAnalysisHelpers.js";
-import { semanticStaticPropertyName } from "./javascriptAstValues.js";
+import {
+  semanticStaticPropertyKey,
+  unwrapJavaScriptExpression,
+} from "./javascriptAstValues.js";
 import type { JavaScriptFindingContext } from "./javascriptStaticAnalysisState.js";
 
 /** Inspect BrowserWindow, contextBridge, and utility-process syntax. */
@@ -44,7 +48,11 @@ const inspectBrowserWindow = (
 ): void => {
   const path = electronCalleePath(node.callee, context);
   if (path?.length !== 1 || path[0] !== "BrowserWindow") return;
-  const options = argumentNode(node.arguments[0]);
+  const argument = argumentNode(node.arguments[0]);
+  const options =
+    argument === undefined
+      ? undefined
+      : unwrapJavaScriptExpression(argument).node;
   const collected = collectWindowOptions(context.source, options);
   context.accumulator.unknownFindings += collected.unknown;
   const finding: ElectronBrowserWindowFinding = {
@@ -78,17 +86,18 @@ const collectWindowOptions = (
   readonly unknown: number;
 } => {
   const lookup = objectProperty(options, "webPreferences");
-  if (
-    lookup.status !== "explicit" ||
-    !t.isObjectExpression(lookup.property.value)
-  )
+  const preferences =
+    lookup.status === "explicit"
+      ? unwrapJavaScriptExpression(lookup.property.value).node
+      : undefined;
+  if (lookup.status !== "explicit" || !t.isObjectExpression(preferences))
     return {
       status: lookup.status === "missing" ? "missing" : "dynamic",
       preferences: [],
       preload: { preload_path: null, preload_resolution_context: null },
       unknown: lookup.status === "missing" ? 0 : 1,
     };
-  return collectWebPreferences(source, lookup.property.value);
+  return collectWebPreferences(source, preferences);
 };
 
 const collectWebPreferences = (
@@ -125,8 +134,8 @@ const collectWebPreferences = (
       });
       continue;
     }
-    const name = semanticStaticPropertyName(property.key, property.computed);
-    if (name === "" || property.computed) {
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) {
       unknown += 1;
       preferences.push({
         name: `[dynamic@${String(property.start ?? -1)}]`,
@@ -166,18 +175,19 @@ const inspectContextBridge = (
   context: JavaScriptFindingContext,
 ): void => {
   const path = electronCalleePath(node.callee, context);
-  const exposureMethod =
-    path?.length === 2 && path[0] === "contextBridge" ? path[1] : undefined;
-  const main = exposureMethod === "exposeInMainWorld";
-  const isolated = exposureMethod === "exposeInIsolatedWorld";
-  if (!main && !isolated) return;
-  const keyNode = argumentNode(node.arguments[isolated ? 1 : 0]);
-  const apiNode = argumentNode(node.arguments[isolated ? 2 : 1]);
+  const exposure =
+    path?.length === 2 && path[0] === "contextBridge"
+      ? contextBridgeExposureArguments(path[1] ?? "", node.arguments)
+      : undefined;
+  if (exposure === undefined) return;
+  const keyNode = argumentNode(exposure.apiKey);
+  const apiNode = argumentNode(exposure.api);
   const key = electronStaticValue(context.source, keyNode);
   const api = collectContextBridgeMembers(apiNode);
-  const worldId = isolated
-    ? electronStaticValue(context.source, argumentNode(node.arguments[0]))
-    : null;
+  const worldId =
+    exposure.worldId === null
+      ? null
+      : electronStaticValue(context.source, argumentNode(exposure.worldId));
   const unknown =
     (key.status === "dynamic" ? 1 : 0) +
     (worldId?.status === "dynamic" ? 1 : 0) +
@@ -191,7 +201,7 @@ const inspectContextBridge = (
         : { api_key: null, api_key_expression: null };
   const finding: ElectronContextBridgeFinding = {
     ...apiKey,
-    world: isolated ? "isolated" : "main",
+    world: exposure.world,
     world_id: worldId,
     api_status: api.status,
     members: api.members,
@@ -201,7 +211,7 @@ const inspectContextBridge = (
   };
   addLocatedFinding(context, {
     collection: context.accumulator.contextBridgeApis,
-    key: `context-bridge\0${isolated ? "isolated" : "main"}\0${finding.api_key ?? finding.api_key_expression ?? "[missing]"}`,
+    key: `context-bridge\0${exposure.world}\0${finding.api_key ?? finding.api_key_expression ?? "[missing]"}`,
     node,
     value: finding,
   });

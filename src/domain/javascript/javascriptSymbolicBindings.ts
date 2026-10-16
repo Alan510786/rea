@@ -1,25 +1,24 @@
 import * as t from "@babel/types";
 import {
   semanticStaticPropertyKey,
+  semanticWriteSiteTarget,
+  semanticWriteTargets,
+  runtimeFunctionParameters,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import { javascriptBootstrapAt } from "./javascriptBootstrap.js";
+import { ELECTRON_MODULE } from "./javascriptElectronMemberWrites.js";
 import {
-  collectJavaScriptIdentityWritesSteps,
-  ELECTRON_MODULE,
-  electronMemberPath,
-  electronExportPath,
-} from "./javascriptElectronMemberWrites.js";
-import { createSemanticModuleInterop } from "./javascriptModuleInterop.js";
-import { SemanticPropertyPathCoverage } from "./javascriptSemanticPropertyPaths.js";
-import { semanticRequireOrigin } from "./javascriptSemanticRequireOrigin.js";
+  indexJavaScriptElectronIdentitySteps,
+  type JavaScriptElectronIdentity,
+} from "./javascriptSemanticAnalysis.js";
+import { semanticArrayIndex } from "./javascriptSemanticPropertyPaths.js";
 import { symbolicLogicalRight } from "./javascriptSymbolicControlFlow.js";
 import {
   moduleFactory,
   modulePropertyName,
 } from "./javascriptStaticAnalysisHelpers.js";
 import {
-  childNodes,
   completeSemanticSteps,
   traverseJavaScriptAst,
 } from "./javascriptSemanticTraversal.js";
@@ -51,6 +50,25 @@ interface SymbolicReturnFlow {
   readonly fallsThrough: boolean;
 }
 const emptyEnvironment: SymbolicEnvironment = { values: new Map() };
+const isObjectPrototypeSetter = (
+  property: t.ObjectMethod | t.ObjectProperty,
+  name: string,
+): boolean =>
+  t.isObjectProperty(property) &&
+  !property.computed &&
+  !property.shorthand &&
+  name === "__proto__";
+
+const containsOwnedReturn = (root: t.Node): boolean => {
+  let found = false;
+  traverseJavaScriptAst(root, {
+    skip: (node) => found || t.isFunction(node) || t.isClass(node),
+    enter: (node) => {
+      if (t.isReturnStatement(node)) found = true;
+    },
+  });
+  return found;
+};
 
 /** Demand-driven substitutions for local bindings, closures and literal module tables. */
 export class JavaScriptSymbolicBindings {
@@ -71,7 +89,7 @@ export class JavaScriptSymbolicBindings {
     ReadonlyMap<string, t.ObjectMethod | t.ObjectProperty> | null
   >();
   readonly #mutated = new Set<string>();
-  readonly #electronWrites = new SemanticPropertyPathCoverage();
+  readonly #electronIdentity: JavaScriptElectronIdentity;
   readonly #namespaceOwners = new Map<string, t.Function>();
   readonly #unsafeExports = new Set<string>();
   readonly #aliasesByBinding = new Map<string, string[]>();
@@ -87,8 +105,11 @@ export class JavaScriptSymbolicBindings {
   constructor(
     readonly state: JavaScriptSemanticAnalysisState,
     program: t.Program,
+    electronIdentity = completeSemanticSteps(
+      indexJavaScriptElectronIdentitySteps(program, state),
+    ),
   ) {
-    this.#indexElectronWrites(program);
+    this.#electronIdentity = electronIdentity;
     this.#indexBindingAliases();
     traverseJavaScriptAst(program, {
       enter: (node) => {
@@ -97,12 +118,8 @@ export class JavaScriptSymbolicBindings {
     });
     traverseJavaScriptAst(program, {
       enter: (node) => {
-        if (t.isAssignmentExpression(node))
-          this.#indexWrite(node.left, node.right, node);
-        if (t.isUpdateExpression(node))
-          this.#indexWrite(node.argument, node, node);
-        if (t.isUnaryExpression(node, { operator: "delete" }))
-          this.#indexWrite(node.argument, node, node);
+        const target = semanticWriteSiteTarget(node);
+        if (target !== null) this.#indexWriteSite(target, node);
         if (
           t.isCallExpression(node) &&
           t.isMemberExpression(node.callee) &&
@@ -202,8 +219,8 @@ export class JavaScriptSymbolicBindings {
     if (value.kind === "external") {
       const path = [...value.path, key];
       if (
-        path[0] === "electron" &&
-        this.#electronWrites.covers(path.slice(1))
+        ELECTRON_MODULE.test(path[0] ?? "") &&
+        !this.#electronIdentity.intactExport(path)
       ) {
         return symbolicUnknown("overwritten Electron API member");
       }
@@ -244,15 +261,30 @@ export class JavaScriptSymbolicBindings {
             index = null;
             break;
           }
+          if (isObjectPrototypeSetter(property, name)) continue;
           properties.set(name, property);
         }
         this.#literalPropertyIndex.set(value.node, index);
       }
       if (index !== null) {
         const property = index.get(key);
-        return property === undefined
-          ? symbolicUnknown("missing property")
-          : this.#objectPropertyValue(property, value.environment);
+        if (property !== undefined)
+          return this.#objectPropertyValue(property, value.environment);
+        if (key === "__proto__") {
+          const prototypeSetter = [...value.node.properties]
+            .reverse()
+            .filter(
+              (candidate): candidate is t.ObjectMethod | t.ObjectProperty =>
+                !t.isSpreadElement(candidate),
+            )
+            .find((candidate) => isObjectPrototypeSetter(candidate, key));
+          if (prototypeSetter !== undefined)
+            return this.#objectPropertyValue(
+              prototypeSetter,
+              value.environment,
+            );
+        }
+        return symbolicUnknown("missing property");
       }
       for (const p of [...value.node.properties].reverse()) {
         if (t.isSpreadElement(p)) {
@@ -270,8 +302,11 @@ export class JavaScriptSymbolicBindings {
           return symbolicUnknown("dynamic property overwrite");
       }
     }
-    if (value.kind === "array" && /^\d+$/u.test(key))
-      return value.values[Number(key)] ?? symbolicUnknown("missing argument");
+    if (value.kind === "array") {
+      const index = semanticArrayIndex(key);
+      if (index !== null)
+        return value.values[index] ?? symbolicUnknown("missing argument");
+    }
     return symbolicUnknown("unresolved property");
   }
 
@@ -315,7 +350,8 @@ export class JavaScriptSymbolicBindings {
           t.isSpreadElement(p)
             ? this.members(this.evaluate(p.argument, value.environment), active)
             : [semanticStaticPropertyKey(p.key, p.computed)].filter(
-                (k): k is string => k !== null,
+                (k): k is string =>
+                  k !== null && !isObjectPrototypeSetter(p, k),
               ),
         ),
       ),
@@ -364,7 +400,7 @@ export class JavaScriptSymbolicBindings {
     invocationNode?: t.Node,
   ): SymbolicEnvironment {
     const values = new Map<string, SymbolicValue>();
-    fn.node.params.forEach((param, index) => {
+    runtimeFunctionParameters(fn.node).forEach((param, index) => {
       const target = t.isRestElement(param) ? param.argument : param;
       if (!t.isIdentifier(target)) return;
       const binding = resolveSemanticBindingState(
@@ -499,13 +535,16 @@ export class JavaScriptSymbolicBindings {
         : symbolicUnknown("unbound identifier");
     if (binding.definitions.some((d) => d.kind === "assignment"))
       return symbolicUnknown("reassigned binding");
-    if (this.#mutated.has(binding.bindingId))
+    // Electron member identity is checked at the selected property. A write
+    // to one method must not erase the module origin or unaffected siblings.
+    const electronOrigin = this.#electronIdentity.exportPath(node);
+    if (electronOrigin === undefined && this.#mutated.has(binding.bindingId))
       return symbolicUnknown("dynamic member writes");
     for (let e: SymbolicEnvironment | undefined = env; e; e = e.parent) {
       const value = e.values.get(binding.bindingId);
       if (value) return value;
     }
-    if (this.#writes.has(binding.bindingId))
+    if (electronOrigin === undefined && this.#writes.has(binding.bindingId))
       return symbolicUnknown("overwritten object members");
     const initializer =
       binding.initializers.length === 1 ? binding.initializers[0] : undefined;
@@ -522,7 +561,7 @@ export class JavaScriptSymbolicBindings {
       this.unresolved = true;
       return symbolicUnknown("initializer not available at this read");
     }
-    if (this.state.conditionalInitializers.has(initializer.node))
+    if (this.state.conditionallySkippedExpressions.has(initializer.node))
       return symbolicUnknown("conditional initializer");
     let value = this.evaluate(initializer.node, env);
     for (const key of initializer.projection) {
@@ -609,20 +648,19 @@ export class JavaScriptSymbolicBindings {
 
   #moduleCompletionPoint(factory: t.Function): t.Node {
     let earliestReturn: t.ReturnStatement | undefined;
-    const pending: t.Node[] = [factory.body];
-    while (pending.length > 0) {
-      const node = pending.pop();
-      if (!node) continue;
-      if (node !== factory.body && (t.isFunction(node) || t.isClass(node)))
-        continue;
-      if (
-        t.isReturnStatement(node) &&
-        (earliestReturn === undefined ||
-          (node.start ?? Infinity) < (earliestReturn.start ?? Infinity))
-      )
-        earliestReturn = node;
-      pending.push(...childNodes(node));
-    }
+    // Use the shared traversal so source-sized child lists are pushed one at
+    // a time. Spreading array elements or call arguments overflows the stack.
+    traverseJavaScriptAst(factory.body, {
+      skip: (node) => t.isFunction(node) || t.isClass(node),
+      enter: (node) => {
+        if (
+          t.isReturnStatement(node) &&
+          (earliestReturn === undefined ||
+            (node.start ?? Infinity) < (earliestReturn.start ?? Infinity))
+        )
+          earliestReturn = node;
+      },
+    });
     return earliestReturn ?? factory.body;
   }
 
@@ -809,6 +847,24 @@ export class JavaScriptSymbolicBindings {
             unresolvedFallthrough = true;
         }
       }
+      if (
+        t.isWhileStatement(statement) ||
+        t.isDoWhileStatement(statement) ||
+        t.isForStatement(statement) ||
+        t.isForInStatement(statement) ||
+        t.isForOfStatement(statement) ||
+        t.isSwitchStatement(statement) ||
+        t.isTryStatement(statement)
+      ) {
+        if (containsOwnedReturn(statement)) {
+          possible.push(
+            symbolicUnknown(
+              `unsupported return control flow: ${statement.type}`,
+            ),
+          );
+          unresolvedFallthrough = true;
+        }
+      }
     }
     return { values: possible, fallsThrough: true };
   }
@@ -840,9 +896,7 @@ export class JavaScriptSymbolicBindings {
           ? {}
           : { scopeId: this.state.scopeByNode.get(factory)!.scopeId }),
       };
-      const first = factory.params[0];
-      const second = factory.params[1];
-      const third = factory.params[2];
+      const [first, second, third] = runtimeFunctionParameters(factory);
       const binding = (n: t.Node | undefined) =>
         t.isIdentifier(n)
           ? resolveSemanticBindingState(this.state, n, n.name)?.bindingId
@@ -898,108 +952,6 @@ export class JavaScriptSymbolicBindings {
     }
   }
 
-  #indexElectronWrites(program: t.Program): void {
-    const interop = createSemanticModuleInterop(this.state);
-    const pathsByBinding = new Map<string, readonly string[] | null>();
-    const retainPath = (
-      bindingId: string,
-      path: readonly string[] | undefined,
-    ): readonly string[] | undefined => {
-      pathsByBinding.set(bindingId, path ?? null);
-      return path;
-    };
-    const bindingPath = (
-      binding: ReturnType<typeof resolveSemanticBindingState>,
-      visited = new Set<string>(),
-    ): readonly string[] | undefined => {
-      if (!binding || visited.has(binding.bindingId)) return undefined;
-      const cached = pathsByBinding.get(binding.bindingId);
-      if (cached !== undefined) return cached ?? undefined;
-      visited.add(binding.bindingId);
-      const converted = interop.origin(binding)?.origin;
-      const direct =
-        converted ??
-        (binding.directOrigins.length === 1
-          ? binding.directOrigins[0]
-          : undefined);
-      if (direct && ELECTRON_MODULE.test(direct.specifier))
-        return retainPath(binding.bindingId, [
-          "electron",
-          ...electronExportPath(direct.importedPath),
-        ]);
-      const initializer =
-        binding.initializers.length === 1 ? binding.initializers[0] : undefined;
-      if (
-        !initializer ||
-        !initializer.projection.every(
-          (segment): segment is string => typeof segment === "string",
-        )
-      )
-        return retainPath(binding.bindingId, undefined);
-      const required = semanticRequireOrigin(
-        initializer.node,
-        this.state,
-      )?.origin;
-      if (required && ELECTRON_MODULE.test(required.specifier))
-        return retainPath(binding.bindingId, [
-          "electron",
-          ...electronExportPath([
-            ...required.importedPath,
-            ...initializer.projection.map(String),
-          ]),
-        ]);
-      const member = electronMemberPath(initializer.node);
-      if (
-        !t.isIdentifier(member.root) ||
-        !member.members.every(
-          (segment): segment is string => typeof segment === "string",
-        )
-      )
-        return retainPath(binding.bindingId, undefined);
-      const source = resolveSemanticBindingState(
-        this.state,
-        member.root,
-        member.root.name,
-      );
-      const sourcePath = bindingPath(source, visited);
-      return retainPath(
-        binding.bindingId,
-        sourcePath === undefined
-          ? undefined
-          : [
-              ...sourcePath,
-              ...member.members,
-              ...initializer.projection.map(String),
-            ],
-      );
-    };
-    const rootPath = (root: t.Node): readonly string[] | undefined => {
-      const direct = semanticRequireOrigin(root, this.state)?.origin;
-      if (direct && ELECTRON_MODULE.test(direct.specifier))
-        return ["electron", ...electronExportPath(direct.importedPath)];
-      if (!t.isIdentifier(root)) return undefined;
-      const binding = resolveSemanticBindingState(this.state, root, root.name);
-      return bindingPath(binding);
-    };
-    completeSemanticSteps(
-      collectJavaScriptIdentityWritesSteps(
-        program,
-        (root, kind) => {
-          if (kind === "opaque-call") return interop.opaqueMutationPath(root);
-          return rootPath(root) ?? interop.intrinsicPath(root);
-        },
-        interop.intrinsicInvocation,
-        interop.staticString,
-        interop.isFreshObject,
-        (_node, path) => {
-          if (path[0] === "electron") {
-            this.#electronWrites.retain(path.slice(1));
-          }
-        },
-      ),
-    );
-  }
-
   #invalidateBootstrapTable(
     tableAliases: ReadonlySet<string>,
     modules: Map<string, SymbolicValue>,
@@ -1020,15 +972,33 @@ export class JavaScriptSymbolicBindings {
     else for (const key of invalidSlots) modules.delete(key);
   }
 
-  #indexWrite(target: t.Node, value: t.Node, site: t.Node): void {
+  #indexWriteSite(target: t.Node, site: t.Node): void {
+    const direct = unwrapJavaScriptExpression(target).node;
+    if (
+      (t.isIdentifier(direct) || t.isMemberExpression(direct)) &&
+      !t.isForOfStatement(site) &&
+      !t.isForInStatement(site)
+    ) {
+      this.#indexWrite(
+        direct,
+        t.isAssignmentExpression(site) ? site.right : site,
+        site,
+      );
+      return;
+    }
+    for (const leaf of semanticWriteTargets(target))
+      this.#indexWrite(leaf, site, site, false);
+  }
+
+  #indexWrite(target: t.Node, value: t.Node, site: t.Node, exact = true): void {
     const path: string[] = [];
-    let root = target;
-    let dynamic = false;
+    let root = unwrapJavaScriptExpression(target).node;
+    let dynamic = !exact;
     while (t.isMemberExpression(root)) {
       const key = semanticStaticPropertyKey(root.property, root.computed);
       if (key === null) dynamic = true;
       else path.unshift(key);
-      root = root.object;
+      root = unwrapJavaScriptExpression(root.object).node;
     }
     if (dynamic && t.isIdentifier(root)) {
       const binding = resolveSemanticBindingState(this.state, root, root.name);

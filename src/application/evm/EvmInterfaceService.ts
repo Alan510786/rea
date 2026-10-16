@@ -15,6 +15,7 @@ import {
 } from "../../domain/evm/evmInterface.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { err, ok, type Result } from "../../domain/result.js";
+import { completeProviderEvidence } from "../ProviderOperationExecution.js";
 
 const OPERATION = "inspect_evm_interface";
 const diagnosticsSchema = z.object({
@@ -59,14 +60,13 @@ export class EvmInterfaceService {
     const outputOptions = diagnostics.success
       ? { capturedOutput: diagnostics.data.diagnostics }
       : undefined;
-    if (options?.signal?.aborted)
-      return err(new AnalysisCancelledError(OPERATION, outputOptions));
     const execution = inspected.value;
     const report = evmInterfaceSchema.safeParse(execution.result);
     if (
       !report.success ||
       report.data.artifact.path !== input.data.path ||
       report.data.artifact.encoding !== input.data.encoding ||
+      execution.subject?.format !== "file" ||
       execution.subject?.path !== input.data.path ||
       execution.subject.sha256 !== report.data.artifact.sha256
     )
@@ -77,18 +77,23 @@ export class EvmInterfaceService {
           outputOptions,
         ),
       );
-    return ok(
-      createEvidence(execution.subject, execution.provider, {
-        operation: OPERATION,
-        parameters: input.data,
-        result: report.data,
-        ...(execution.rawResult === null
-          ? {}
-          : { rawResult: execution.rawResult }),
-        confidence: "inferred",
-        locations: execution.locations,
-        limitations: execution.limitations,
-      }),
+    return completeProviderEvidence(
+      ok(
+        createEvidence(execution.subject, execution.provider, {
+          operation: OPERATION,
+          parameters: input.data,
+          result: report.data,
+          ...(execution.rawResult === null
+            ? {}
+            : { rawResult: execution.rawResult }),
+          confidence: "inferred",
+          locations: execution.locations,
+          limitations: execution.limitations,
+        }),
+      ),
+      OPERATION,
+      options,
+      outputOptions,
     );
   }
 }
